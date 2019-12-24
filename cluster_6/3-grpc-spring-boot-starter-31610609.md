@@ -1,0 +1,373 @@
+= Spring boot starter for http://www.grpc.io/[gRPC framework.]
+:toc:
+
+image:https://img.shields.io/maven-central/v/io.github.lognet/grpc-spring-boot-starter.svg?label=Maven%20Central[link=https://search.maven.org/search?q=g:%22io.github.lognet%22%20AND%20a:%22grpc-spring-boot-starter%22]
+image:https://travis-ci.org/LogNet/grpc-spring-boot-starter.svg?branch=master[Build Status,link=https://travis-ci.org/LogNet/grpc-spring-boot-starter]
+image:https://codecov.io/gh/LogNet/grpc-spring-boot-starter/branch/master/graph/badge.svg["Codecov", link="https://codecov.io/gh/LogNet/grpc-spring-boot-starter/branch/master"]
+
+:toc:
+:source-highlighter: prettify
+:numbered:
+:icons: font
+
+
+
+== Features
+Auto-configures and runs the embedded gRPC server with @GRpcService-enabled beans as part of spring-boot application. +
+
+The starter can be used both by *1.5.X* and *2.X.X* spring boot applications.
+
+== Setup
+
+[source,gradle]
+----
+repositories {  
+    mavenCentral()
+   //maven { url "https://oss.sonatype.org/content/repositories/snapshots" } //for snashot builds
+   
+}
+dependencies {
+    compile 'io.github.lognet:grpc-spring-boot-starter:3.3.0'
+}
+
+
+----
+
+[IMPORTANT]
+Starting from release `3.0.0` the artifacts are published to *maven central*.
+Pay attention that `group` has changed from `org.lognet` to `io.github.lognet`.
+
+
+
+
+
+[NOTE]
+The release notes with compatibility matrix can be found link:ReleaseNotes.adoc[here^]
+
+== Usage
+
+* Start by https://github.com/google/protobuf-gradle-plugin[generating] stub and server interface(s) from your `.proto` file(s).
+* Annotate your server interface implementation(s) with `@org.lognet.springboot.grpc.GRpcService`
+* Optionally configure the server port in your `application.yml/properties`. Default port is `6565`.
+
+[source,yaml]
+----
+ grpc:
+    port: 6565
+----
+[NOTE]
+A random port can be defined by setting the port to `0`. +
+The actual port being used can then be retrieved by using `@LocalRunningGrpcPort` annotation on `int` field which will inject the running port (explicitly configured or randomly selected)
+
+* Optionally enable server reflection, see https://github.com/grpc/grpc-java/blob/master/documentation/server-reflection-tutorial.md)
+
+[source,yaml]
+----
+ grpc:
+    enableReflection: true
+----
+
+The starter supports also the `in-process server`, which should be used for testing purposes :
+
+[source,yaml]
+----
+ grpc:
+    enabled: false <1>
+    inProcessServerName: myTestServer <2>
+----
+<1> Disables the default server (`NettyServer`).
+<2> Enables the `in-process` server.
+
+[NOTE]
+If you enable both the `NettyServer` and `in-process` server, they will both share the same instance of `HealthStatusManager` and `GRpcServerBuilderConfigurer` (see <<Custom gRPC Server Configuration>>).
+
+
+
+== Show case
+
+In the `grpc-spring-boot-starter-demo` project you can find fully functional examples with integration tests. +
+The `grpc-spring-boot2-starter-demo` project runs the same demo services and tests with *spring boot 2*.
+
+=== Service implementation
+The service definition from `.proto` file looks like this :
+[source,proto]
+----
+service Greeter {
+    rpc SayHello ( HelloRequest) returns (  HelloReply) {}
+}
+----
+
+Note the generated `io.grpc.examples.GreeterGrpc.GreeterImplBase` class that extends `io.grpc.BindableService`.(The generated classes were intentionally committed for demo purposes).
+
+All you need to do is to annotate your service implementation with `@org.lognet.springboot.grpc.GRpcService`
+
+[source,java]
+----
+    @GRpcService
+    public static class GreeterService extends  GreeterGrpc.GreeterImplBase{
+        @Override
+        public void sayHello(GreeterOuterClass.HelloRequest request, StreamObserver<GreeterOuterClass.HelloReply> responseObserver) {
+            final GreeterOuterClass.HelloReply.Builder replyBuilder = GreeterOuterClass.HelloReply.newBuilder().setMessage("Hello " + request.getName());
+            responseObserver.onNext(replyBuilder.build());
+            responseObserver.onCompleted();
+        }
+    }
+----
+
+=== Interceptors support
+The starter supports the registration of two kinds of interceptors: _Global_  and _Per Service_. +
+In both cases the interceptor has to implement `io.grpc.ServerInterceptor` interface.
+
+- Per service
+
+[source,java]
+----
+@GRpcService(interceptors = { LogInterceptor.class })
+public  class GreeterService extends  GreeterGrpc.GreeterImplBase{
+    // ommited
+}
+----
+`LogInterceptor` will be instantiated via spring factory if there is bean of type `LogInterceptor`, or via no-args constructor otherwise.
+
+- Global
+
+[source,java]
+----
+@GRpcGlobalInterceptor
+public  class MyInterceptor implements ServerInterceptor{
+    // ommited
+}
+----
+
+The annotation on java config factory method is also supported :
+
+[source,java]
+----
+ @Configuration
+ public class MyConfig{
+     @Bean
+     @GRpcGlobalInterceptor
+     public  ServerInterceptor globalInterceptor(){
+         return new ServerInterceptor(){
+             @Override
+             public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
+                // your logic here
+                 return next.startCall(call, headers);
+             }
+         };
+     }
+ }
+----
+Global interceptors can be ordered using Spring's `@Ordered` or `@Priority` annotations. Following Spring's ordering semantics, lower order values have higher priority and will be executed first in the interceptor chain.
+
+[source,java]
+----
+@GRpcGlobalInterceptor
+@Order(10)
+public  class A implements ServerInterceptor{
+    // will be called before B
+}
+
+@GRpcGlobalInterceptor
+@Order(20)
+public  class B implements ServerInterceptor{
+    // will be called after A
+}
+----
+
+
+The particular service also has the opportunity to disable the global interceptors :
+
+[source,java]
+----
+@GRpcService(applyGlobalInterceptors = false)
+public  class GreeterService extends  GreeterGrpc.GreeterImplBase{
+    // ommited
+}
+----
+
+
+=== Custom gRPC Server Configuration
+
+To intercept the `io.grpc.ServerBuilder` instance used to build the `io.grpc.Server`, you can add bean that inherits from `org.lognet.springboot.grpc.GRpcServerBuilderConfigurer` to your context  and override the `configure` method. +
+By the time of invocation of `configure` method, all discovered services, including theirs interceptors, had been added to the passed builder. +
+In your implementation of `configure` method, you can add your custom configuration:
+
+[source,java]
+----
+@Component
+public class MyGRpcServerBuilderConfigurer extends GRpcServerBuilderConfigurer{
+        @Override
+        public void configure(ServerBuilder<?> serverBuilder){
+            serverBuilder
+                .executor(YOUR EXECUTOR INSTANCE)
+                .compressorRegistry(YOUR COMPRESSION REGISTRY)
+                .decompressorRegistry(YOUR DECOMPRESSION REGISTRY)
+                .useTransportSecurity(YOUR TRANSPORT SECURITY SETTINGS);
+            ((NettyServerBuilder)serverBuilder)// cast to NettyServerBuilder (which is the default server) for further customization
+                    .maxConnectionAge(...)
+                    .maxConnectionAgeGrace(...);
+
+        }
+    };
+}
+----
+
+[NOTE]
+If you enable both `NettyServer` and `in-process` servers, the `configure` method will be invoked on the same instance of configurer. +
+If you need to differentiate between the passed `serverBuilder` s, you can check the type. +
+This is the current limitation.
+
+== Consul Integration
+
+Starting from version `3.3.0`, the starter will auto-register the running grpc server in Consul registry  if `org.springframework.cloud:spring-cloud-starter-consul-discovery` is in classpath. +
+The registered service name will be prefixed with `grpc-` ,i.e. `grpc-${spring.application.name}` to not interfere with standard registered web-service name if you choose to run both embedded `Grpc` and `Web` servers. +
+
+
+== Eureka Integration
+
+When building production-ready services, the advise is to have separate project for your service(s) gRPC API that holds only proto-generated classes both for server and client side usage. +
+You will then add this project as `compile` dependency to your `gRPC client` and `gRPC server` projects.
+
+To integrate `Eureka` simply follow the great https://spring.io/guides/gs/service-registration-and-discovery/[guide] from Spring.
+
+Below are the essential parts of configurations for both server and client projects.
+
+===  gRPC Server Project
+
+* Add eureka starter as dependency of your server project together with generated classes from `proto` files:
+
+[source, gradle]
+.build.gradle
+----
+ dependencies {
+     compile('org.springframework.cloud:spring-cloud-starter-eureka')
+     compile project(":yourProject-api")
+ }
+----
+
+
+* Configure gRPC server to register itself with Eureka.
+
+
+[source, yaml]
+.bootstrap.yaml
+----
+spring:
+    application:
+        name: my-service-name <1>
+----
+<1> Eureka's `ServiceId` by default is the spring application name, provide it before the service registers itself with Eureka.
+
+[source,yaml]
+.application.yaml
+----
+grpc:
+    port: 6565 <1>
+eureka:
+    instance:
+        nonSecurePort: ${grpc.port} <2>
+    client:
+        serviceUrl:
+            defaultZone: http://${eureka.host:localhost}:${eureka.port:8761}/eureka/ <3>
+----
+<1> Specify the port number the gRPC is listening on.
+<2> Register the eureka service port to be the same as `grpc.port` so client will know where to send the requests to.
+<3> Specify the  registry URL, so the service will register itself with. 
+
+
+* Expose the gRPC service as part of Spring Boot Application.
+
+[source, java]
+.EurekaGrpcServiceApp.java
+----
+ @SpringBootApplication
+ @EnableEurekaClient
+ public class EurekaGrpcServiceApp {
+
+     @GRpcService
+     public static class GreeterService extends GreeterGrpc.GreeterImplBase {
+         @Override
+         public void sayHello(GreeterOuterClass.HelloRequest request, StreamObserver<GreeterOuterClass.HelloReply> responseObserver) {
+
+         }
+     }
+
+     public static void main(String[] args) {
+         SpringApplication.run(DemoApp.class,args);
+     }
+ }
+----
+
+===  gRPC Client Project
+
+* Add eureka starter as dependency of your client project together with generated classes from `proto` files:
+
+[source, gradle]
+.build.gradle
+----
+ dependencies {
+     compile('org.springframework.cloud:spring-cloud-starter-eureka')
+     compile project(":yourProject-api")
+ }
+----
+
+* Configure client to find the eureka service registry:
+
+[source,yaml]
+.application.yaml
+----
+eureka:
+  client:
+    register-with-eureka: false <1>
+    service-url:
+      defaultZone: http://${eureka.host:localhost}:${eureka.port:8761}/eureka/ <2>
+----
+<1> `false` if this project is not meant to act as  a service to another client.
+<2>  Specify the  registry URL, so this client  will know where to look up the required service.
+
+
+[source,java]
+.GreeterServiceConsumerApplication.java
+----
+@EnableEurekaClient
+@SpringBootApplication
+public class GreeterServiceConsumerApplication {
+ public static void main(String[] args) {
+   SpringApplication.run(GreeterServiceConsumerApplication.class, args);
+ }
+}
+----
+
+* Use EurekaClient to get the coordinates of gRPC service instance from Eureka and consume the service :
+
+[source,java]
+.GreeterServiceConsumer.java
+----
+@EnableEurekaClient
+@Component
+public class GreeterServiceConsumer {
+    @Autowired
+    private EurekaClient client;
+    
+    public void greet(String name) {
+        final InstanceInfo instanceInfo = client.getNextServerFromEureka("my-service-name", false);<1>
+        final ManagedChannel channel = ManagedChannelBuilder.forAddress(instanceInfo.getIPAddr(), instanceInfo.getPort())
+                .usePlaintext()
+                .build(); <2>
+        final GreeterServiceGrpc.GreeterServiceFutureStub stub = GreeterServiceGrpc.newFutureStub(channel); <3>
+        stub.greet(name); <4>
+
+    }
+}
+----
+<1> Get the information about the `my-service-name` instance.
+<2> Build `channel` accordingly.
+<3> Create stub using the `channel`.
+<4> Invoke the service.
+
+
+
+== License
+
+Apache 2.0
